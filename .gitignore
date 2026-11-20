@@ -1,0 +1,22 @@
+*.pth
+new_models/
+pretrained/
+routing-MARL/new_models/
+routing-MARL/baselines/mappo_mat/new_models/
+
+# run outputs
+routing-MARL/runs/
+routing-MARL/result/
+routing-MARL/baselines/mappo_mat/result/
+routing-MARL/network/*/routes.xml
+routing-MARL/network/*/summary.xml
+routing-MARL/network/*/tripinfo.xml
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+.vscode/
+.idea/

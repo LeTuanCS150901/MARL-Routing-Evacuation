@@ -1,0 +1,110 @@
+# bl_man.yaml - MAPPO / MAT baselines, Manhattan. Same network, groups, hazard zones, reward and SUMO rules as Coop-Eva;
+# training demand manhattan2train.rou.xml (80 cars). Tuned keys: model.PPO.batch_size / gae_lamda / entropy_coef (MAPPO) and
+# model.MAT.memory_buffer_size / entropy_coef (MAT); see README, section Baselines.
+# Train:     python train.py --algo mappo --config manhattan --run-name <name>
+
+algorithm: mappo                     # mappo | mat (or --algo on the command line)
+
+# ---------- network and files ----------
+net_file: "../../../network/manhattan2/manhattan2.net.xml"  # keep-clear on
+route_file: "../../../network/manhattan2/manhattan2train.rou.xml"   # training demand (80 cars)
+sumo_config: "../../../network/manhattan2/manhattan2.sumocfg"  # copied into <run>/sumo/run.sumocfg by main.py
+saved_route: "../../../network/manhattan2/routes.xml"            # replaced by <run>/sumo/routes.xml
+routing_algorithm: "astar"
+saved_dir: 'bl_man'
+
+# ---------- groups ----------
+destinations_edges: ['542258337#0', '68325062#0', '195745917#0', '1030123275#0']
+origin_edges: ['384649121#0', '350726028#0', '464683329#0', '542096279#0']
+
+# ---------- hazards (paper and vman); baseline layout: one row per zone, feature_dim 1 ----------
+disaster:
+  fire:
+    disaster_zones:
+        1: ['1061622295#0']
+        2: ['384178813#0']
+        3: ['-945473887#2', '-438389785#2']
+        4: ['441405436#0']
+        5: ['350726031', '-458106348#2']
+    type: 'fire'
+    feature_dim: 1
+  radius_safe: 25
+hazard_close: false                  # evaluation: --set hazard_close=true (closes the zone roads to cars)
+
+# ---------- vdo SUMO rules ----------
+sumo_rules:                          # start options (simulation.py reset_simulation)
+  ignore_junction_blocker: -1
+  collision_action: warn
+sumocfg_processing:                  # written into run.sumocfg (main.py prepare_run_sumo_config)
+  tls.all-off: "True"
+  no-internal-links: "True"
+  threads: 1                         # evaluation: --set sumocfg_processing.threads=64
+
+# ---------- vdo reward ----------
+late_fine: true                      # rule C: -P on the last decision of a car not at its own shelter at the end
+no_arrival_penalty_s: null           # null = simulation_steps
+shelter_rule: true                   # a car next to its own shelter always enters it
+
+# ---------- training loop ----------
+num_episodes: 150
+simulation_steps: 1500
+early_stop: {episode: 100, window: 10, min_arrival: 0.2}
+batch_size: 32
+beta_soft: 0.005
+buffer_capacity: 1000000
+learning_rate: 0.00001
+gamma: 0.99
+max_grad_norm: 10                    
+weight_decay: 1e-4
+
+model:
+  encoder:
+    num_heads: 4
+    head_dim: 64
+    num_encoder_layers: 2
+    dropout_p: 0.01
+  q_network:
+    hidden_sizes: [1024, 1024, 1024, 512, 512, 512]
+  PPO:
+    eps_clip: 0.2
+    K_epochs: 10
+    batch_size: 5000                 # tuned: B1 / B2 (original 2048)
+    mini_batch_size: 32
+    entropy_coef: 0.1               # tuned: 0.01 / 0.001 
+    critic_coef: 0.5
+    gae_lamda: 0.95                  # tuned: 0.95 / 0.7 (original 0.9)
+    shared_mlp: [512, 1024, 128]
+    actor_layers: [128, 256]
+    critic_layers: [128, 256]
+  MAT:
+    num_heads: 4
+    head_dim: 64
+    num_encoder_layers: 2
+    num_decoder_layers: 2
+    policy_layers: [512, 256]
+    value_layers: [512, 256]
+    memory_buffer_size: 5000         # tuned: B1 / B2 (original 2048)
+    ppo_epochs: 30
+    clip_eps: 0.2
+    entropy_coef: 0.01               # tuned: 0.01 / 0.001 (original 0.3)
+    mini_batch_size: 32
+    batch_size: 1
+
+# ---------- normalisation and reward weights ----------
+reward_type: "R1"
+reward:
+  MSE:
+    d_weight: 1
+    dead_edge: -10000000000000
+  R1R2:
+    w1: 0.8
+    w2: 0.2
+max_vehicles_edge: 20
+max_speed: 39.44
+
+# ---------- keys the code reads (not used by the baselines) ----------
+adaptive_layer_controller: {cooldown: 500, epsilon: 1e-6, threshold: 475, streak_target: 100}
+offline_training: False
+epsilon_greedy: {initial: 1, final: 0.001, decay: 600}
+UCB: {c: 2}
+softmax: {tau: 2.3}

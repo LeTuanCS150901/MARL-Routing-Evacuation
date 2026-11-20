@@ -1,0 +1,400 @@
+import libsumo as traci
+import sys
+import os
+import time
+import numpy as np
+
+from logs.logger import logger  # import our custom logger
+from utils.check_end_episode import CheckEndEpisode
+
+# --- SETUP ---
+if 'SUMO_HOME' not in os.environ:
+    logger.error("Please set the SUMO_HOME environment variable")
+    sys.exit("Please set the SUMO_HOME environment variable")
+
+sys.path.append(os.path.join(os.environ['SUMO_HOME'], 'tools'))
+
+
+def _count_sumo_events(multi_agents):
+    """r22: collisions (collision.action warn keeps the cars) and teleports of this step."""
+    multi_agents.ep_stats['collisions'] += len(traci.simulation.getCollisions())
+    multi_agents.ep_stats['teleports'] += traci.simulation.getStartingTeleportNumber()
+
+def set_routing_mode(trips, vehicle_ids):
+    """
+    Set the routing for vehicles to always routing based on smoothed travel time of traffic condition
+    """
+    # logger.debug("Setting mode for vehicles routing based on smoothed travel time")
+    # Get the list of active vehicle IDs in the simulation.
+    # vehicle_ids = traci.vehicle.getIDList()
+    # filter trips that we control. Other trips background are controlled default by SUMO
+    controlled_vehicle_ids = np.intersect1d(vehicle_ids, list(trips.keys())) 
+    for vid in controlled_vehicle_ids:
+        traci.vehicle.setRoutingMode(vid, traci.constants.ROUTING_MODE_AGGREGATED)
+
+    return controlled_vehicle_ids
+
+def run_simulation(edges, trips, last_edge, multi_agents, CONFIG, simulation_steps=700, disaster_move=None):
+    """
+    Launch SUMO simulation using TraCI, and interact with vehicles
+    by looking up edges in a NetworkX graph for re-routing.
+    """
+    # instance to check if the episode has ended
+    episode_checker = CheckEndEpisode(trips)
+    latest_depart_time = max(int(info['depart'])
+                             for info in trips.values()) + 10
+    multi_agents.begin_episode()   # r22: per-episode counters
+    # run simultion
+    for step in range(simulation_steps):
+
+        logger.info(f"Step {step}")
+        # Advance the simulation by one step.
+        traci.simulationStep()
+        _count_sumo_events(multi_agents)
+
+        if disaster_move:
+            # simulate disaster evolution
+            disaster_move.simulate_points(step)
+            # update risk parameters after 30s interval
+            if step % 30 ==0:
+                disaster_move.compute_risks_numba()
+                logger.success(f"Recalculated risks and Update new edge costs at step {step}")
+                multi_agents.apply_new_edges_weight(disaster_move)
+
+        # simulate vehicles routing
+        try:
+            # # Get the list of active vehicle IDs in the simulation.
+            # vehicle_ids = traci.vehicle.getIDList()
+            # # filter trips that we control. Other trips background are controlled default by SUMO
+            # controlled_vehicle_ids = np.intersect1d(vehicle_ids, list(trips.keys())) 
+            vehicle_ids = traci.vehicle.getIDList()
+            controlled_vehicle_ids = set_routing_mode(trips, vehicle_ids)
+
+            current_time = traci.simulation.getTime() 
+            for vid in controlled_vehicle_ids:
+                if episode_checker.is_trip_completed(vid):
+                    logger.info(f"Vehicle {vid} has already completed its trip. Skipping re-routing.")
+                    continue
+
+                # Retrieve the current edge (i.e., road segment) where the vehicle is located.
+                curr_edge = traci.vehicle.getRoadID(vid)
+
+                # If the current edge is internal (which starts with ":"), skip re-routing.
+                if curr_edge.startswith(":"):
+                    logger.warning(f"Current edge {curr_edge} is internal. Keeping original  route for vehicle {vid}.")
+                    continue
+                
+                # If the vehicle is still on the same edge as last time,
+                # skip processing this vehicle for re-routing.
+                if vid in last_edge and last_edge[vid] == curr_edge:
+                    # logger.info(f"Vehicle {vid} still on edge {curr_edge} from previous step; skipping re-route update.")
+                    continue
+                # otherwise, Record the current edge for the vehicle.
+                logger.info(f"[Step {step}] Vehicle {vid} is on edge: {curr_edge}")
+                last_edge[vid] = curr_edge    
+                # Save the current edge into history edges of vehicle 
+                episode_checker.set_edge_history_trip(vid, curr_edge)
+
+                # Check if the current edge exists within our edge mapping (created by our network graph).
+                if curr_edge in edges:
+                    # Check if the vehicle has reached its destination.  
+                    if curr_edge in CONFIG['destinations_edges']:
+                        # if this is a true dest
+                        if curr_edge == trips[vid]['to']:  
+                            logger.success(f"Vehicle {vid} has reached its dest: {curr_edge}. Stopping vehicle.")  
+                            episode_checker.mark_trip_completed(vid) # mark trip as completed
+                        # if this is a wrong dest
+                        else:
+                            logger.warning(f"Vehicle {vid} has reached wrong dest: {curr_edge}. Stopping vehicle.") 
+
+
+                        # TODO: check error here to match output arrivals and arrival in summary.xml
+                        
+                        # current_time = traci.simulation.getTime() 
+                        episode_checker.mark_time_vehicle_removed(vid, current_time)
+                        traci.vehicle.remove(vid)  # Remove the vehicle from the simulation  
+                        # mark time when vehicle is removed from simulation
+                        continue  # Skip further processing since the vehicle has arrived.  
+
+                    # Get the list of possible next edges that are connected to the current edge.
+                    connected_edges = edges[curr_edge]["connected_edges"]
+                    if not connected_edges:
+                        logger.warning(f"No connected edges found for {curr_edge}.")
+                        logger.warning(f"Vehicle {vid} dissapear at {curr_edge}.")
+                        continue
+                    logger.info(f"Vehicle {vid} can take these next edges: {connected_edges}")
+                    # Randomly select one of the connected edges as the next edge.
+                    # next_edge = random.choice(connected_edges) if connected_edges else None
+                    
+                    try: # check if we run offline training for data collection
+                        offline_training = CONFIG['offline_training']
+                    except:
+                        logger.warning("No offline training config found, set to False")
+                        offline_training = False
+
+                    # if do offline training
+                    if offline_training:
+                        next_edge = multi_agents.collect_offline_data(vid, curr_edge, connected_edges, disaster_move)
+                    else:
+                        next_edge, append_route = multi_agents.step(vid, curr_edge, connected_edges, disaster_move)
+                    # TODO: check if offline RL => then collect data for training
+                    logger.info(f"selected next_edge: {next_edge}")
+                    
+                else:
+                    # This is dead edge
+                    # Log a warning if the current edge is not found in our edge mapping.
+                    logger.warning(f"{curr_edge} not found in edge map")
+                    continue
+
+                if next_edge:    
+                    # Build a new route for the vehicle consisting of the current edge followed by the chosen next edge + subsequence edges.
+                    # this help to avoid SUMO bug of removing vehicles when we do edge-based routing
+                    # but in reality, the vehicle only go to next chosen edge, and the 
+                    # rerouting will be repeated again and not follow subsequence edges
+                    if append_route:
+                        new_route = [curr_edge] + append_route
+                        logger.success(f"Append route successfully to veh {vid}")
+                    else:
+                        new_route = [curr_edge, next_edge] 
+
+                    traci.vehicle.setRoute(vid, new_route)
+
+                else:
+                    # If no valid next edge is found => current edge lead to dead edge
+                    logger.warning(f"Current edge {curr_edge} of vehicle {vid} leads to dead edge. Remove vehicle from simulation")
+                    traci.vehicle.remove(vid)              
+
+            # After the current simulation step, trigger training of transitions of all current vehicles
+            multi_agents.end_timestep(time_step=current_time)
+            multi_agents.reset_timestep_rewards()
+        except Exception as e:
+            # Log any exceptions that occur during the simulation step.
+            logger.exception(f"Error during simulation step {step}: {e}")
+            multi_agents.count_error(e)   # r22: an error ends this second's car loop; it is counted
+            continue
+        
+        if episode_checker.is_ended_episode(trips):
+            logger.success("-------------------All trips have arrrived. Episode ended.")
+            logger.success(f"Break the SIMULATION TIME at {step} steps")
+            break  
+
+        # TODO: if all the controlled vehicles disappear (reach dest, or go to dead loop), break the simulation loop
+        if step > latest_depart_time:
+            if len(np.intersect1d(vehicle_ids, list(trips.keys()))) == 0:
+                logger.success("-------------------All trips have disappeard. Episode ended.")
+                logger.success(f"Break the SIMULATION TIME at {step} steps")
+                break
+    
+    # TODO: After the end of episode, add -Penalty for vehicle not reach destination in time limit
+    not_completed_trips = episode_checker.get_trips_not_completed(trips)
+    if not_completed_trips:
+        logger.info(f"Add Penalty for trips not completed after episode: {len(not_completed_trips)} / {len(trips)}")
+        # multi_agents.penalty_agents_loops(not_completed_trips, episode_checker)
+    # r22 rule C (late fine): every car not at its own shelter now (still driving, wrong shelter, dead end)
+    multi_agents.apply_late_fines(not_completed_trips)
+
+    # After the end of episode, add Reward for vehicle that reached destination in time limit
+    completed_trips = episode_checker.get_trips_completed()
+    if completed_trips:
+        logger.info(f"Add reward for trips completed after episode: {len(completed_trips)} / {len(trips)}")
+        # multi_agents.add_reward_reaching_dest(completed_trips, episode_checker)
+
+    # Write the number of arrived vehicles at the end of episode
+    # TOOD: user traci.getArrived instead
+    multi_agents.save_arrived_vehicles(len(completed_trips))
+    multi_agents.episode_summary(multi_agents.plotter.current_episode + 1, len(completed_trips), len(trips))
+  
+
+    # Close the TraCI connection after the simulation ends.
+    # traci.close(wait=True)
+    traci.close()
+    multi_agents.plotter.write_survived_vehicles()
+
+def run_simulation_inference(edges, trips, last_edge, multi_agents, CONFIG, simulation_steps=1000, disaster_move=None):
+    """
+    Launch SUMO simulation using TraCI, and interact with vehicles
+    by looking up edges in a NetworkX graph for re-routing.
+    """
+    # instance to check if the episode has ended
+    episode_checker = CheckEndEpisode(trips)
+
+    latest_depart_time = max(int(info['depart'])
+                             for info in trips.values())
+    multi_agents.begin_episode()   # r22: counters
+    arrived_own, wrong_shelter = set(), set()
+
+    # run simultion
+    for step in range(simulation_steps):
+
+        logger.info(f"Step {step}")
+        # Advance the simulation by one step.
+        traci.simulationStep()
+        _count_sumo_events(multi_agents)
+
+        if disaster_move:
+            # simulate disaster evolution
+            disaster_move.simulate_points(step)
+            # update risk parameters after 30s interval
+            if step % 30 ==0:
+                disaster_move.compute_risks_numba()
+                logger.success(f"Recalculated risks and Update new edge costs at step {step}")
+                multi_agents.apply_new_edges_weight(disaster_move)
+        try:
+            # # Get the list of active vehicle IDs in the simulation.
+            # vehicle_ids = traci.vehicle.getIDList()
+            # # filter trips that we control. Other trips background are controlled default by SUMO
+            # controlled_vehicle_ids = np.intersect1d(vehicle_ids, list(trips.keys())) 
+            vehicle_ids = traci.vehicle.getIDList()
+            controlled_vehicle_ids = set_routing_mode(trips, vehicle_ids)
+
+            for vid in controlled_vehicle_ids:
+
+                if episode_checker.is_trip_completed(vid):
+                    logger.info(f"Vehicle {vid} has already completed its trip. Skipping re-routing.")
+                    continue
+
+                # Retrieve the current edge (i.e., road segment) where the vehicle is located.
+                curr_edge = traci.vehicle.getRoadID(vid)
+                # curr_edge =  traci.vehicle.getLaneID(vid)
+
+                # If the current edge is internal (which starts with ":"), skip re-routing.
+                if curr_edge.startswith(":"):
+                    logger.warning(f"Current edge {curr_edge} is internal. Keeping original  route for vehicle {vid}.")
+                    continue
+                
+                # If the vehicle is still on the same edge as last time,
+                # skip processing this vehicle for re-routing.
+                if vid in last_edge and last_edge[vid] == curr_edge:
+                    # logger.info(f"Vehicle {vid} still on edge {curr_edge} from previous step; skipping re-route update.")
+                    continue
+                # otherwise, Record the current edge for the vehicle.
+                logger.info(f"[Step {step}] Vehicle {vid} is on edge: {curr_edge}")
+                last_edge[vid] = curr_edge    
+                # Save the current edge into history edges of vehicle 
+                episode_checker.set_edge_history_trip(vid, curr_edge)
+
+                # Check if the current edge exists within our edge mapping (created by our network graph).
+                if curr_edge in edges:
+                    # Check if the vehicle has reached its destination.  
+                    if curr_edge in CONFIG['destinations_edges']:
+                        # if this is a true dest
+                        if curr_edge == trips[vid]['to']:
+                            logger.success(f"Vehicle {vid} has reached its dest: {curr_edge}. Stopping vehicle.")
+                            arrived_own.add(vid)
+                        # if this is a wrong dest
+                        else:
+                            logger.warning(f"Vehicle {vid} has reached wrong dest: {curr_edge}. Stopping vehicle.")
+                            wrong_shelter.add(vid)
+                        # r22 (vdo fix 1816a78): end the trip on this shelter edge (a normal SUMO arrival, in
+                        # tripinfo); the car gets no more decisions. A wrong shelter counts as not arrived.
+                        traci.vehicle.setRoute(vid, [curr_edge])
+                        episode_checker.mark_trip_completed(vid)
+                        continue  # Skip further processing since the vehicle has arrived.
+
+                    # Get the list of possible next edges that are connected to the current edge.
+                    connected_edges = edges[curr_edge]["connected_edges"]
+                    if not connected_edges:
+                        logger.warning(f"No connected edges found for {curr_edge}.")
+                        logger.warning(f"Vehicle {vid} dissapear at {curr_edge}.")
+                        continue
+                    logger.info(f"Vehicle {vid} can take these next edges: {connected_edges}")
+                    # Randomly select one of the connected edges as the next edge.
+                    # next_edge = random.choice(connected_edges) if connected_edges else None
+                    next_edge, append_route = multi_agents.step(vid, curr_edge, connected_edges, disaster_move)
+                    logger.info(f"selected next_edge: {next_edge}")
+                    
+                else:
+                    # This is dead edge
+                    # Log a warning if the current edge is not found in our edge mapping.
+                    logger.warning(f"{curr_edge} not found in edge map")
+                    continue
+
+                if next_edge:    
+                     # Build a new route for the vehicle consisting of the current edge followed by the chosen next edge.
+                    if append_route:
+                        new_route = [curr_edge] + append_route
+                        logger.success(f"Append route successfully to veh {vid}")
+                    else:
+                        new_route = [curr_edge, next_edge]
+                                  
+                    traci.vehicle.setRoute(vid, new_route)
+                    logger.info(f"Vehicle {vid} choose new edge: {next_edge}")
+                    
+                else:
+                    # If no valid next edge is found => current edge lead to dead edge
+                    logger.warning(f"Current edge {curr_edge} of vehicle {vid} leads to dead edge. Remove vehicle from simulation")
+                    traci.vehicle.remove(vid)              
+
+            # r22: the tip slept 0.1 s here per step (debug delay; 72 min over 43,200 s). Removed.
+        except Exception as e:
+            # Log any exceptions that occur during the simulation step.
+            logger.exception(f"Error during simulation step {step}: {e}")
+            multi_agents.count_error(e)   # r22: counted
+            continue
+        
+        # if step >= latest_depart_time +640:
+        #     logger.success("Remove remaining vehs")
+        #     [traci.vehicle.remove(veh, reason=2) for veh in controlled_vehicle_ids]
+
+        # after all trips are maked as reach destination
+        if episode_checker.is_ended_episode(trips):
+            # we check if all the controlled vehicle removed from the simulation or not
+            done_simulation = True
+            for trip in list(trips.keys()):
+                if trip in controlled_vehicle_ids:
+                    done_simulation = False
+
+            if done_simulation: 
+                # if all the controlled vehicle removed from the simulation
+                logger.error("-------------------All trips have arrrived. Episode ended.")
+                logger.error(f"Break the SIMULATION TIME at {step} steps") 
+                break 
+        
+        # check trips not completed after simulation
+        not_completed_trips = episode_checker.get_trips_not_completed(trips)
+        if step > latest_depart_time and not_completed_trips:
+            logger.info(f"Trips not completed: {not_completed_trips}")
+                
+    
+    print(f"own shelter: {len(arrived_own)}, wrong shelter: {len(wrong_shelter)}, "
+          f"still driving: {len(trips) - len(arrived_own) - len(wrong_shelter)}", flush=True)
+    multi_agents.episode_summary('inference', len(arrived_own), len(trips))
+    # Close the TraCI connection after the simulation ends.
+    traci.close()   # r22: libsumo close() takes no argument (the tip passed False: TypeError)
+
+def reset_simulation(episode, CONFIG):
+    """  
+    Resets the SUMO simulation by starting a new simulation instance.  
+    """ 
+    logger.info(f"Starting SUMO simulation at episode {episode + 1}...")
+    
+    sumo_cmd = [
+                CONFIG['sumo_binary'] , "-c",
+                CONFIG['sumo_config'], "--start", 
+                "--routing-algorithm", CONFIG['routing_algorithm'],
+                "--device.rerouting.adaptation-steps", "4",
+                "--collision.action", "none",
+                "--collision.mingap-factor", "1.0",
+                "--ignore-junction-blocker", "1.0"
+            ]
+    # r22 (as vdo, 33187d9 + e5311bc): config block sumo_rules replaces the start options above;
+    # without the block the tip options stay as they are
+    rules = CONFIG.get('sumo_rules') or {}
+    def _set(opt, val):
+        if opt in sumo_cmd:
+            sumo_cmd[sumo_cmd.index(opt) + 1] = str(val)
+        else:
+            sumo_cmd.extend([opt, str(val)])
+    if 'ignore_junction_blocker' in rules:
+        _set("--ignore-junction-blocker", rules['ignore_junction_blocker'])
+    if 'collision_action' in rules:
+        _set("--collision.action", rules['collision_action'])
+    if 'time_to_teleport' in rules:
+        _set("--time-to-teleport", rules['time_to_teleport'])
+    if episode == 0:
+        print(f"SUMO_START {' '.join(sumo_cmd)}", flush=True)
+
+    traci.start(sumo_cmd)  # Start a new instance of SUMO
+    if CONFIG.get('hazard_close'):
+        from hazard_mask import close_hazard_roads
+        close_hazard_roads(CONFIG, traci)

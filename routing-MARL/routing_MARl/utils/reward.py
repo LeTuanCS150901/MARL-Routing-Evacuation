@@ -1,0 +1,997 @@
+from logs.logger import logger
+import traci
+import numpy as np
+import pandas as pd 
+import os
+from read_config import get_config
+
+# import traci.constants
+
+class Reward:  
+    def __init__(self, agents_manager):  
+        # Store reference to the manager  
+        self.agents_manager = agents_manager  
+
+        self.CONFIG = get_config()  
+        self.clipped_steps = {}  # group -> decisions changed by get_reward_5_clip in this episode
+        self.positive_steps = {}  # group -> decisions with a positive get_reward_5_inc reward in this episode (expected 0)
+        self.repeat_penalty_sum = {}  # group -> total repeat penalty of get_reward_5_clip_rep in this episode
+        self.delay_penalty_sum = {}  # group -> total delay penalty of get_reward_5_delay in this episode
+        try:
+            self.R = self.CONFIG['disaster']['radius_safe'] # safe radius of agent during a disaster event
+        except Exception as e:
+            logger.warning("No disaster radius found in config")
+
+        if self.agents_manager.disaster_zones: # if there are disaster zones
+            self.all_disaster_edges = [
+                        edge_id
+                        for edges in self.agents_manager.disaster_zones.values()
+                        for edge_id in edges
+                    ] # get all edges of disaster zones in the network. THis can be update over time if dynamic disaster
+    
+    def get_reward_MSE(self, next_edge, dest_edge):
+        """
+        R = (1-t/tmax)^2 + (1-d/max)^2 + I
+        t: travel to next edge
+        tmax: max free-flow travel time of all edges
+        d: euclid distance of next edge to dest edge
+        dmax: max euclid distance of an edge to dest edge
+        I: -alpha if next edge is a dead edge
+        """
+        travel_time_reward = 0.0
+        travel_time_next_edge = traci.edge.getTraveltime(next_edge)
+      
+        distance_reward = 0.0
+        # get the distance euclid from next edge to the destination edge
+        next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+
+        # calculate travel time reward
+        if travel_time_next_edge > self.agents_manager.max_travel_time:
+            travel_time_reward = 1
+        else:
+            travel_time_reward = (travel_time_next_edge / self.agents_manager.max_travel_time)
+
+        # calculate distance reward
+        if next_edge_distance > self.agents_manager.d_max:
+            distance_reward = 1
+        else:
+            distance_reward = (next_edge_distance / self.agents_manager.d_max)
+
+        travel_time_reward = (1 - travel_time_reward)**2
+        distance_reward = (1 - distance_reward)**2
+
+       # check if current edge is a dead edge 
+        penalty_dead_edge = 0
+        if self.agents_manager.is_dead_edge(next_edge):
+                penalty_dead_edge = (self.agents_manager.dead_edge)**2
+
+        return travel_time_reward + self.agents_manager.d_weight * distance_reward + penalty_dead_edge
+    
+    def get_reward_based_d_weight(self, next_edge, dest_edge):
+        """
+        R = [alpha * (1-t/tmax)] / [(1+d/dmax)] + I 
+        t: travel to next edge
+        tmax: max free-flow travel time of all edges
+        d: euclid distance of next edge to dest edge
+        dmax: max euclid distance of an edge to dest edge
+        I: -alpha if next edge is a dead edge
+        """
+        travel_time_reward = 0
+        travel_time_next_edge = traci.edge.getTraveltime(next_edge)
+      
+        distance_reward = 0
+        # get the distance euclid from next edge to the destination edge
+        next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+
+        # calculate travel time reward
+        if travel_time_next_edge > self.agents_manager.max_travel_time:
+            travel_time_reward = 1
+        else:
+            travel_time_reward = (travel_time_next_edge / self.agents_manager.max_travel_time)
+
+        # calculate distance reward
+        if next_edge_distance > self.agents_manager.d_max:
+            distance_reward = 1
+        else:
+            distance_reward = (next_edge_distance / self.agents_manager.d_max)
+
+       # check if current edge is a dead edge 
+        penalty_dead_edge = 0
+        if self.agents_manager.is_dead_edge(next_edge):
+                penalty_dead_edge = (self.agents_manager.dead_edge)**2
+
+        base_reward = (self.agents_manager.d_weight*(1-distance_reward)) / (1+ travel_time_reward) + penalty_dead_edge
+
+        # TODO: add penalty if agent choose wrong destination
+        # because 2 destination might near each other, so even choose desti, the reward is enough
+        # so the agent keep choosing the wrong dest
+        penalty_wrong_dest = 0
+        if next_edge in self.agents_manager.destination_edges:
+            if next_edge != dest_edge:
+                logger.error(f"Vehicle {next_edge} chose wrong destination: {dest_edge}")
+                penalty_wrong_dest = -self.agents_manager.d_weight
+                logger.error(f"reward {base_reward + penalty_wrong_dest}")
+        
+        return base_reward + penalty_wrong_dest
+             
+    def get_reward_risk_model(self, next_edge, dest_edge):
+        """
+        R = [alpha * (1-t/tmax)] / [(1+d/dmax)] * Rsafe - I
+        t: travel to next edge
+        tmax: max free-flow travel time of all edges
+        d: euclid distance of next edge to dest edge
+        dmax: max euclid distance of an edge to dest edge
+        Rsafe (risk reward): ds/dsmax 
+             dsmax: radius of the disaster zone 
+             ds: min (ds, dsmax)
+        I: -alpha if agent choose wrong dest
+        """
+        travel_time_reward = 0.0
+        travel_time_next_edge = traci.edge.getTraveltime(next_edge)
+      
+        distance_reward = 0.0
+        # get the distance euclid from next edge to the destination edge
+        next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+
+        # calculate travel time reward
+        if travel_time_next_edge > self.agents_manager.max_travel_time:
+            travel_time_reward = 1
+        else:
+            travel_time_reward = (travel_time_next_edge / self.agents_manager.max_travel_time)
+
+        logger.error(f"travel time:{travel_time_next_edge} for the edge chosen {next_edge}")
+
+        # calculate distance reward
+        if next_edge_distance > self.agents_manager.d_max:
+            distance_reward = 1
+        else:
+            distance_reward = (next_edge_distance / self.agents_manager.d_max)
+        logger.error(f"distance euclid to dest:{next_edge_distance} with the edge chosen {next_edge}")
+
+        # calculate the risk reward. This is the distance to the mean of disaster
+        ds_reward = 1
+        # get nearest disaster zone and distance to that zone
+        nearest_zone, ds = self.agents_manager.get_nearest_disaster(next_edge)
+        if nearest_zone and ds:
+            # if the distance to that zone > the zone's radius 
+            if ds >= self.agents_manager.disaster_info[nearest_zone]['radius']:
+                ds_reward = 1
+            else:
+                ds_reward = ds / self.agents_manager.disaster_info[nearest_zone]['radius']
+        else:
+            logger.error("Error when get nearest disaster infor")
+
+        logger.error(f"ds to disaster:{ds} with the edge chosen {next_edge}")
+        base_reward = ((self.agents_manager.d_weight * (1 - distance_reward)) / (1 + travel_time_reward)) * ds_reward
+            
+        # add penalty if agent choose wrong destination
+        # because 2 destination might near each other, so even choose desti, the reward is enough
+        # so the agent keep choosing the wrong dest
+        penalty_wrong_dest = 0
+        if next_edge in self.agents_manager.destination_edges:
+            if next_edge != dest_edge:
+                logger.error(f"Vehicle {next_edge} chose wrong destination: {dest_edge}")
+                penalty_wrong_dest = -self.agents_manager.d_weight
+                logger.error(f"based reward {base_reward + penalty_wrong_dest}")
+        logger.error(f"penalty reward value {penalty_wrong_dest} with the edge chosen {next_edge}")
+        return base_reward + penalty_wrong_dest
+    
+    def get_reward_1(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+        """
+        R = [alpha * (1-t/tmin)] / [(1+d/dmax)] + I
+        this reward:
+        - t: expected time of option -> dest
+        - tmin: min expected time of current edge -> dest 
+        - d: euclid distance of option -> dest
+        - dmax: (euclid distance of origin -> dest) * 2
+        - I: -alpha if agent choose wrong dest
+        """
+        # calculate distance reward
+        distance_reward = 0.0
+        # get the distance euclid from next edge to the destination edge
+        next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+   
+        origin = self.agents_manager.trips[vehicle_id]['from']
+        dest = self.agents_manager.trips[vehicle_id]['to']
+        try:
+            dist_od = self.agents_manager.dist_OD[origin][dest] * 2
+        except Exception as e: 
+            logger.error("Error when accessing distance OD")
+
+        if next_edge_distance > dist_od:
+            distance_reward = 1
+        else:
+            distance_reward = (next_edge_distance / dist_od)
+        logger.error(f"distance euclid to dest:{next_edge_distance} with the edge chosen {next_edge}")
+
+        # calculate travel time reward
+        travel_time_reward = 0.0
+        # calculate the travel time from current edge to the destination edge
+        min_travel_time = np.inf  
+        route = traci.simulation.findRoute(curr_edge, dest)
+        # if there is route connected to dest
+        if len(route.edges) != 0:  
+            min_travel_time = route.travelTime
+
+        # calculate the travel time from next edge selected to the destination edge
+        route_next_edge_chosen = traci.simulation.findRoute(next_edge, dest)
+        # if there is no route connected to dest
+        if len(route_next_edge_chosen.edges) == 0:
+            travel_time_next_edge = np.inf  
+        else:
+            travel_time_next_edge = route_next_edge_chosen.travelTime
+
+        travel_time_reward = travel_time_next_edge / min_travel_time
+        logger.error(f"currrent vehicle is {vehicle_id}")
+        logger.error(f"travel time:{travel_time_next_edge} for the edge chosen {next_edge}, at current edge {curr_edge} with travel time {min_travel_time}")
+        
+        base_reward = ((self.agents_manager.d_weight * (1 - distance_reward)) / (1 + travel_time_reward)) 
+
+        # add penalty if agent choose wrong destination
+        # because 2 destination might near each other, so even choose desti, the reward is enough
+        # so the agent keep choosing the wrong dest
+        penalty_wrong_dest = 0
+        if next_edge in self.agents_manager.destination_edges:
+            if next_edge != dest_edge:
+                logger.error(f"Vehicle {vehicle_id} chose wrong destination: {next_edge}")
+                penalty_wrong_dest = -self.agents_manager.d_weight
+                logger.error(f"based reward {base_reward + penalty_wrong_dest}")
+        logger.error(f"penalty reward value {penalty_wrong_dest} with the edge chosen {next_edge}")
+       
+        return base_reward + penalty_wrong_dest
+    
+    def get_reward_2(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+        """
+        R = [alpha * (1-t/tmax)] / [(1+d/dmax)] + I
+        - t: expected time of chosen option->dest
+        - tmax: max expected time of options->dest
+        - d: (euclid distance of option -> dest) * 2
+        - dmax: euclid distance of origin -> dest
+        """
+        # calculate distance reward
+        distance_reward = 0.0
+        # get the distance euclid from next edge to the destination edge
+        next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+   
+        origin = self.agents_manager.trips[vehicle_id]['from']
+        dest = self.agents_manager.trips[vehicle_id]['to']
+        try:
+            dist_od = self.agents_manager.dist_OD[origin][dest] * 2
+        except Exception as e: 
+            logger.error("Error when accessing distance OD")
+
+        if next_edge_distance > dist_od:
+            distance_reward = 1
+        else:
+            distance_reward = (next_edge_distance / dist_od)
+        logger.error(f"distance euclid to dest:{next_edge_distance} with the edge chosen {next_edge}")
+
+
+        max_travel_time = 0.0
+        travel_time_reward = 0.0
+
+        indices = np.where(np.array(feasible_actions) == 1)[0] # filter indices with 1 value in feasible actions
+        for edge_idx in indices:
+            edge_id = self.agents_manager.edges_list[edge_idx]
+            route = traci.simulation.findRoute(edge_id, dest) 
+            # if there is route connected to dest
+            if len(route.edges) != 0:  
+                max_travel_time = max(max_travel_time, route.travelTime)
+
+        route_next_edge = traci.simulation.findRoute(next_edge, dest)
+        travel_time_next_edge = route_next_edge.travelTime
+        if len(route_next_edge.edges) == 0:
+            travel_time_reward = 1
+        else:
+            travel_time_reward = travel_time_next_edge / max_travel_time
+    
+        logger.error(f"currrent vehicle is {vehicle_id}")
+        logger.error(f"travel time:{travel_time_next_edge} for the edge chosen {next_edge}, at current edge {curr_edge}")
+    
+        base_reward = ((self.agents_manager.d_weight * (1 - distance_reward)) / (1 + travel_time_reward)) 
+
+        # add penalty if agent choose wrong destination
+        # because 2 destination might near each other, so even choose desti, the reward is enough
+        # so the agent keep choosing the wrong dest
+        penalty_wrong_dest = 0
+        if next_edge in self.agents_manager.destination_edges:
+            if next_edge != dest_edge:
+                logger.error(f"Vehicle {vehicle_id} chose wrong destination: {next_edge}")
+                penalty_wrong_dest = -self.agents_manager.d_weight
+                logger.error(f"based reward {base_reward + penalty_wrong_dest}")
+        logger.error(f"penalty reward value {penalty_wrong_dest} with the edge chosen {next_edge}")
+        
+        return base_reward + penalty_wrong_dest
+    
+    def get_reward_3(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+        """
+        R = -t
+        t: expected travel time of chosen option->dest. This can be obtained by A* algorithm      
+        Because A* already find the path to ensure current connected to dest, so if there is nothing return, 
+        the option should have bad reward to avoide chooding it later  
+        """
+        travel_time_reward = 0.0
+        BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] * 2
+        # find route from selected next edge to destination edge
+        route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+
+        if len(route.edges) != 0:  
+            travel_time = route.travelTime
+            travel_time_reward = -travel_time
+        else:
+            travel_time_reward = -BIG_PENALTY
+            logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+        logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+        
+        return travel_time_reward
+
+    # def get_reward_4(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #     """
+    #     R = w1 * R1 + w2 * R2
+    #     R1: travel time reward
+    #     R2: distance to disaster reward
+    #     """
+    #     # calculate R1 reward: travel time
+    #     R1 = 0.0
+    #     origin = self.agents_manager.trips[vehicle_id]['from']
+    #     dest = self.agents_manager.trips[vehicle_id]['to']
+    #     distance =  self.agents_manager.dist_OD[origin][dest]
+    #     t_min_next_edge = distance / self.agents_manager.max_speed_vehs
+
+    #     t_actual_next_edge = 0.0
+    #     route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+    #     if len(route.edges) != 0:  
+    #         t_actual_next_edge = route.travelTime
+    #         # R1 = (0.00001 + t_min_next_edge) / (0.00001 + t_actual_next_edge)
+    #         R1 =  1.0 / (1.0 + np.exp(-0.08*(t_min_next_edge - t_actual_next_edge)))
+    #     else: # BIG PENALTY FOR CHOOSING DEAD EDGES
+    #         R1 = -1.2
+    #         logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {R1}")
+
+    #     logger.debug(f"travel time reward: {R1} for the edge chosen {next_edge}, at current edge {curr_edge}")
+
+    #     # calculate R2 reward: distance to disaster
+    #     total_r2 = 0.0
+    #     for disaster_id in self.agents_manager.disaster_info:
+    #         disaster = self.agents_manager.disaster_info[disaster_id]
+    #         disaster_radius = disaster['radius']
+    #         # get the distance from next edge to the disaster zone
+    #         ds = self.agents_manager.edges_dist_disaster[next_edge][disaster_id]
+
+    #         logger.error(f"dist to disaster {ds}, disaster radius {disaster_radius}")
+    #         r2 = (disaster_radius / ds)**2
+    #         total_r2 += r2  
+    #         #TODO: ADD PENALTY IF CHOOSING DISATER EDGES
+
+    #     R2 = 1 / (1+ np.sqrt(total_r2))
+
+    #     # TODO: LOG THIS METRIC IN OTHER FILE
+    #     # self.save_not_survive_proba(disaster_radius, ds)
+
+    #     return self.agents_manager.w1 * R1 + self.agents_manager.w2 * R2
+
+    # def get_reward_4(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #     """
+    #     R = w1 * R1 + w2 * R2
+    #     R1: travel time reward
+    #     R2: distance to disaster reward
+    #     """
+    #     # calculate R1 reward: travel time
+    #     R1 = 0.0
+    #     origin = self.agents_manager.trips[vehicle_id]['from']
+    #     dest = self.agents_manager.trips[vehicle_id]['to']
+    #     distance =  self.agents_manager.dist_OD[origin][dest]
+    #     t_min_od = distance / self.agents_manager.max_speed_vehs
+
+    #     t_actual_next_edge = 0.0
+    #     route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+    #     if len(route.edges) != 0:  
+    #         t_actual_next_edge = route.travelTime
+    #         R1 = 1 / (1+ (t_actual_next_edge/t_min_od))
+    #     else: # BIG PENALTY FOR CHOOSING DEAD EDGES
+    #         R1 = -1.2
+    #         logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {R1}")
+
+    #     # calculate reward distance
+    #     origin = self.agents_manager.trips[vehicle_id]['from']
+    #     dest = self.agents_manager.trips[vehicle_id]['to']
+    #     distance_od =  self.agents_manager.dist_OD[origin][dest]
+    #     next_edge_distance = self.agents_manager.edges_distance[next_edge][dest_edge]
+    #     R2_distance_reward = next_edge_distance / distance_od
+
+    #     logger.error(f"Travel reward {R1}")
+    #     logger.error(f"Distance reward {R2_distance_reward}")
+    #     final_reward = self.agents_manager.w1 * R1 + self.agents_manager.w2 * R2_distance_reward
+    #     logger.error(f"final reward {final_reward}")
+
+    #     return final_reward
+    #    
+
+    # def _get_reward_5(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #     """
+    #     Normalize distance to time unit
+    #     [m] -> [s]
+    #     """
+    #     ###### travel time reward ######
+    #     travel_time_reward = 0.0
+    #     BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] * 2
+    #     # find route from selected next edge to destination edge
+    #     route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+
+    #     if len(route.edges) != 0:  
+    #         travel_time = route.travelTime
+    #         travel_time_reward = -travel_time
+    #     else:
+    #         travel_time_reward = -BIG_PENALTY
+    #         logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+    #     logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+        
+
+    #     # calculate median speed of edges in disaster zones
+    #     all_speed_edges_in_disaster = []
+    #     for zone_id in self.agents_manager.disaster_zones:
+    #         disaster_edges = self.agents_manager.disaster_zones[zone_id]
+    #         for edge_id in disaster_edges:
+    #             speed = self.agents_manager.edges[edge_id]['speed']
+    #             all_speed_edges_in_disaster.append(speed)
+        
+    #     logger.error(f"all speed edges in disaster: {all_speed_edges_in_disaster}")
+
+    #     # ###### distance to disaster reward ######
+    #     # list_r2 = np.array([])
+    #     # total_r2 = 0.0
+    #     # for disaster_id in self.agents_manager.disaster_info:
+    #     #     disaster = self.agents_manager.disaster_info[disaster_id]
+    #     #     disaster_radius = disaster['radius']
+    #     #     # get the distance from next edge to the disaster zone
+    #     #     ds = self.agents_manager.edges_dist_disaster[next_edge][disaster_id]
+
+    #     #     logger.error(f"dist to disaster {ds}, disaster radius {disaster_radius}")
+    #     #     total_r2 += ds  
+
+    #     # # divide by max median distance of edges in disater
+    #     # total_r2 = total_r2 / np.median(all_speed_edges_in_disaster)
+    #     # logger.error(f"Convert distance to disaster reward to travel time: {total_r2}")
+
+    #     ###### distance to disaster reward ######
+    #     list_r2 = []
+    #     for disaster_id in self.agents_manager.disaster_info:
+    #         disaster = self.agents_manager.disaster_info[disaster_id]
+    #         disaster_radius = disaster['radius']
+    #         # get the distance from next edge to the disaster zone
+    #         ds = self.agents_manager.edges_dist_disaster[next_edge][disaster_id]
+
+    #         logger.error(f"dist to disaster {ds}, disaster radius {disaster_radius}")
+    #         # divide by max median distance of edges in disater
+    #         r2 = ds / np.median(all_speed_edges_in_disaster)
+    #         list_r2.append(r2)
+    #         logger.error(f"Convert distance from disaster reward to travel time: {r2}")
+
+    #     r2_min = np.min(list_r2)
+    #     logger.error(f"Take the min dinstance of disasters: {r2_min}")
+
+    #     return self.agents_manager.w1*travel_time_reward + self.agents_manager.w2*r2_min
+
+    # def get_reward_5(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #     """
+    #     Sharing mechanism function
+    #     Normalize distance to time unit
+    #     [m] -> [s]
+    #     """
+    #     ###### travel time reward ######
+    #     # current ohter nearby agents also at current edge to allow them share information to current considered agent
+    #     nearyby_vehs_ids = list(traci.edge.getLastStepVehicleIDs(curr_edge))
+        
+    #     #filter only other agents with the same group (same destination edge) as the current agent
+    #     # nearyby_vehs_ids = [veh_id for veh_id in nearyby_vehs_ids if self.agents_manager.trips[veh_id]['to'] == dest_edge]
+    #     nearyby_vehs_ids.remove(vehicle_id) # remove curent veh from the list of nearby veh
+    #     # logger.warning(f"current agent {vehicle_id}, nearby filtered agents: {nearyby_vehs_ids}")
+    #     travel_time_exp_current_edge = traci.edge.getTraveltime(curr_edge)
+
+    #     BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] * 2
+    #     travel_time_reward = self.agents_manager.shared_info.get_and_update_travel_time(vehicle_id,
+    #                                                                                     next_edge, 
+    #                                                                                     dest_edge,
+    #                                                                                     nearyby_vehs_ids, 
+    #                                                                                     travel_time_exp_current_edge)
+    #     if not travel_time_reward:
+    #         travel_time_reward = -BIG_PENALTY
+    #         logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+    #     else:
+    #         travel_time_reward = -travel_time_reward  # negative reward for travel time
+
+    #     logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+        
+
+    #     if not self.agents_manager.disaster_info:
+    #         logger.error("No disaster information available, returning travel time reward only.")
+    #         return travel_time_reward
+        
+    #     # calculate median speed of edges in disaster zones
+    #     all_speed_edges_in_disaster = []
+    #     for zone_id in self.agents_manager.disaster_zones:
+    #         disaster_edges = self.agents_manager.disaster_zones[zone_id]
+    #         for edge_id in disaster_edges:
+    #             speed = self.agents_manager.edges[edge_id]['speed']
+    #             all_speed_edges_in_disaster.append(speed)
+        
+    #     logger.error(f"all speed edges in disaster: {all_speed_edges_in_disaster}")
+
+    #     ###### distance to disaster reward ######
+    #     list_r2 = []
+    #     for disaster_id in self.agents_manager.disaster_info:
+    #         disaster = self.agents_manager.disaster_info[disaster_id]
+    #         disaster_radius = disaster['radius']
+    #         # get the distance from next edge to the disaster zone
+    #         ds = self.agents_manager.edges_dist_disaster[next_edge][disaster_id]
+
+    #         logger.error(f"dist to disaster {ds}, disaster radius {disaster_radius}")
+    #         # divide by max median distance of edges in disater
+    #         r2 = ds / np.median(all_speed_edges_in_disaster)
+    #         list_r2.append(r2)
+    #         logger.error(f"Convert distance from disaster reward to travel time: {r2}")
+
+    #     r2_min = np.min(list_r2)
+    #     logger.error(f"Take the min dinstance of disasters: {r2_min}")
+
+    #     return self.agents_manager.w1*travel_time_reward + self.agents_manager.w2*r2_min
+
+    # def get_reward_5(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #         """
+    #         Normalize distance to time unit
+    #         [m] -> [s]
+    #         """
+    #         ###### travel time reward ######
+    #         travel_time_reward = 0.0
+    #         BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+    #         # find route from selected next edge to destination edge
+    #         route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+
+    #         if len(route.edges) != 0:  
+    #             travel_time = route.travelTime
+    #             travel_time_reward = -travel_time
+    #         else:
+    #             travel_time_reward = -BIG_PENALTY
+    #             logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+    #         # logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+            
+
+    #         if not self.agents_manager.disaster_info:
+    #             logger.warning("No disaster information available, returning travel time reward only.")
+    #             return travel_time_reward
+
+    #         # calculate median speed of edges in disaster zones
+    #         all_speed_edges_in_disaster = []
+    #         for zone_id in self.agents_manager.disaster_zones:
+    #             disaster_edges = self.agents_manager.disaster_zones[zone_id]
+    #             for edge_id in disaster_edges:
+    #                 speed = self.agents_manager.edges[edge_id]['speed']
+    #                 all_speed_edges_in_disaster.append(speed)
+            
+    #         logger.error(f"all speed edges in disaster: {all_speed_edges_in_disaster}")
+
+    #         ###### distance to disaster reward ######
+    #         total_r2 = 0.0
+    #         for disaster_id in self.agents_manager.disaster_info:
+    #             disaster = self.agents_manager.disaster_info[disaster_id]
+    #             disaster_radius = disaster['radius']
+    #             # get the distance from next edge to the disaster zone
+    #             ds = self.agents_manager.edges_dist_disaster[next_edge][disaster_id]
+
+    #             logger.error(f"dist to disaster {ds}, disaster radius {disaster_radius}")
+    #             total_r2 += ds  
+
+    #         # divide by max median distance of edges in disater
+    #         total_r2 = total_r2 / np.median(all_speed_edges_in_disaster)
+    #         logger.error(f"Convert distance to disaster reward to travel time: {total_r2}")
+
+    #         return self.agents_manager.w1*travel_time_reward + self.agents_manager.w2*total_r2
+
+    def get_reward_5(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """
+            Normalize distance to time unit
+            [m] -> [s]
+            This reward maximize the time until the nearest disaster reach vehicle and min the travel time to reach dest
+            Return:
+                - final reward
+                - append_route: the route from next_edge to dest_edge
+
+            """
+            ###### travel time reward ######
+            travel_time_reward = 0.0
+            BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+            # find route from selected next edge to destination edge
+            route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            append_route = None
+
+            if len(route.edges) != 0:  
+                travel_time = route.travelTime
+                travel_time_reward = -travel_time
+                append_route = list(route.edges)
+            else:
+                travel_time_reward = -BIG_PENALTY
+                logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+            # logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+
+            if not self.agents_manager.disaster_info:
+                logger.warning("No disaster information available, returning travel time reward only.")
+                return travel_time_reward, append_route
+                
+            ###### distance to nearest disaster reward ######
+           # Get all disaster IDs and their distances from the next edge to the disasters
+            disaster_ids = list(self.agents_manager.disaster_info.keys())
+            distances = np.array([
+                self.agents_manager.edges_dist_disaster[next_edge][disaster_id] 
+                for disaster_id in disaster_ids
+            ])
+            # Find nearest disaster
+            min_idx = np.argmin(distances)
+            min_distance = distances[min_idx]
+            nearest_disaster_id = disaster_ids[min_idx]
+
+            # Get speed of edges in the NEAREST disaster zone
+            nearest_disaster_edges = self.agents_manager.disaster_zones[nearest_disaster_id]
+            speeds_nearest_disaster = [
+                self.agents_manager.edges[edge_id]['speed'] 
+                for edge_id in nearest_disaster_edges
+            ]
+            # Calculate reward: distance / speed = time to reach nearest disaster
+            speed_nearest_disaster = np.median(speeds_nearest_disaster)  # or np.mean()
+            reward_time_disaster = min_distance / speed_nearest_disaster
+
+            penalty_disaster = 0
+            if next_edge in self.all_disaster_edges:
+                logger.warning(f"Next edge {next_edge} is in disaster edges, penalty {-BIG_PENALTY}")
+                penalty_disaster = -BIG_PENALTY
+                
+            logger.debug(f"Reward (time to nearest disaster): {reward_time_disaster}")
+            final_r = self.agents_manager.w1*travel_time_reward + self.agents_manager.w2*reward_time_disaster + penalty_disaster
+
+            return final_r, append_route
+
+    def get_reward_5_clip(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """get_reward_5 with each step capped at minus the next road's own travel time (no paying circles).
+            r = min( w1*(-T_rem(e')) + w2*T_dis(e') , -w1*t(e') ) + hazard fine; rule C and the appended route unchanged.
+            t(e') = aggregated driving time of e' (findRoute(e', e')), the same source as T_rem.
+            When the cap does not bind, the value is exactly get_reward_5's. Config: reward_function: get_reward_5_clip."""
+            final_r, append_route = self.get_reward_5(curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions)
+            hazard = 0.0
+            if self.agents_manager.disaster_info and next_edge in self.all_disaster_edges:
+                hazard = -float(self.agents_manager.CONFIG['simulation_steps'])
+            # t(e') = driving time of e' itself from the same aggregated (averaged) times as T_rem, so a jam raises
+            # T_rem and t(e') together (the instant traci.edge.getTraveltime explodes in jams)
+            own = traci.simulation.findRoute(next_edge, next_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            if len(own.edges) == 0:
+                return final_r, append_route
+            cap = -self.agents_manager.w1 * own.travelTime
+            if final_r - hazard <= cap:
+                return final_r, append_route
+            self.clipped_steps[dest_edge] = self.clipped_steps.get(dest_edge, 0) + 1
+            return cap + hazard, append_route
+
+    def get_reward_5_clip_rep(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """karlclip reward with a relative repeat penalty:
+            r = r_clip - kappa * m * w1 * T_rem(e'),  m = times e' is in the car's last K roads (its memory window).
+            The extra cost is a share kappa*m of the step's own time cost, never a bonus.
+            Config: reward_function: get_reward_5_clip_rep, repeat_kappa, repeat_window (= memory.window)."""
+            r, append_route = self.get_reward_5_clip(curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions)
+            kappa = self.agents_manager.repeat_kappa
+            w = self.agents_manager.window.get(vehicle_id)
+            if kappa > 0 and w:
+                m = list(w).count(self.agents_manager.edge_idx.get(next_edge, -1))
+                if m > 0:
+                    route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+                    t_rem = route.travelTime if len(route.edges) != 0 else float(self.agents_manager.CONFIG['simulation_steps'])
+                    pen = kappa * m * self.agents_manager.w1 * t_rem
+                    r -= pen
+                    self.repeat_penalty_sum[dest_edge] = self.repeat_penalty_sum.get(dest_edge, 0.0) + pen
+            return r, append_route
+
+    def get_reward_5_delay(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """R5 + delay penalty:
+            r = get_reward_5 - w1 * sqrt(T1_0 * min(D, cap)),  D = max(0, t_now - t_dep + T1(e') - T1_0)
+            T1(e') = findRoute(e', g) aggregated (as R5), (t_dep, T1_0) = the car's trip plan from its first decision.
+            No route from e': D = cap. Config: reward_function: get_reward_5_delay, delay: {enabled, cap_s}."""
+            r5, append_route = self.get_reward_5(curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions)
+            cap = self.agents_manager.delay_cap
+            t_dep, t1_0 = self.agents_manager.trip_plan_of(vehicle_id, curr_edge, dest_edge)
+            route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            if len(route.edges) != 0:
+                d = max(0.0, traci.simulation.getTime() - t_dep + route.travelTime - t1_0)
+            else:
+                d = cap
+            pen = self.agents_manager.w1 * float(np.sqrt(t1_0 * min(d, cap)))
+            self.delay_penalty_sum[dest_edge] = self.delay_penalty_sum.get(dest_edge, 0.0) + pen
+            return r5 - pen, append_route
+
+    def _time_to_disaster(self, edge):
+            """T_dis(edge): distance to the nearest disaster zone / median speed of that zone's roads (as in get_reward_5)."""
+            if edge not in self.agents_manager.edges_dist_disaster:
+                raise KeyError(f"no disaster distance for road {edge}")
+            disaster_ids = list(self.agents_manager.disaster_info.keys())
+            distances = np.array([self.agents_manager.edges_dist_disaster[edge][disaster_id] for disaster_id in disaster_ids])
+            min_idx = np.argmin(distances)
+            speeds = [self.agents_manager.edges[edge_id]['speed']
+                      for edge_id in self.agents_manager.disaster_zones[disaster_ids[min_idx]]]
+            return distances[min_idx] / np.median(speeds)
+
+    def get_reward_5_inc(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """get_reward_5 with the disaster term as a step increment (option A2):
+            r = -w1*T_rem(e') + w2*(gamma*(1-d)*T_dis(e') - T_dis(e)) + hazard fine, d = 1 when e' is a shelter.
+            Over any loop the disaster parts sum to -(1-gamma^k)*w2*T_dis(e0) <= 0, so no loop can pay.
+            Config: reward_function: get_reward_5_inc."""
+            r5, append_route = self.get_reward_5(curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions)
+            if not self.agents_manager.disaster_info:
+                return r5, append_route
+            w2, gamma = self.agents_manager.w2, float(self.agents_manager.CONFIG['gamma'])
+            t_next, t_curr = self._time_to_disaster(next_edge), self._time_to_disaster(curr_edge)
+            done = next_edge in self.agents_manager.destination_edges
+            r = r5 - w2 * t_next + w2 * ((0.0 if done else gamma * t_next) - t_curr)
+            if r > 0:
+                self.positive_steps[dest_edge] = self.positive_steps.get(dest_edge, 0) + 1
+            return r, append_route
+
+    def get_reward_rwt(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """rwtH: r = -T~H_lam(e') + hazard fine.
+            T~H_lam(e'): fastest route from e' to the own shelter with road cost t_k*(1 + lam*exp(-d_k/r_safe)) plus
+            F = simulation_steps seconds on hazard roads (utils/risk_time.py); t_k = aggregated SUMO driving time.
+            Never positive. The appended route (SUMO's fastest route) only steers the car until its next decision.
+            Config: reward_function: get_reward_rwt, rwt_lambda, rwt_r_safe, rwt_fine_in_time, rwt_refresh_s."""
+            table = self.agents_manager.rwt_table
+            table.maybe_refresh(traci.simulation.getTime())
+            big = float(self.agents_manager.CONFIG['simulation_steps'])
+            T = table.value(next_edge, dest_edge)
+            r = -T if np.isfinite(T) else -big
+            if self.agents_manager.disaster_info and next_edge in self.all_disaster_edges:
+                r -= big  # hazard fine on entering, as get_reward_5
+            if r > 0:
+                self.positive_steps[dest_edge] = self.positive_steps.get(dest_edge, 0) + 1
+            route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            return r, (list(route.edges) if len(route.edges) != 0 else None)
+
+    # def get_reward_6(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #         """
+    #         R=w1(-T/Tmax) + w2(-exp(-ds/dsmax))
+    #         where ds: distance euclid to disaster
+    #         dsmax: safe radius of disaster
+    #         """
+    #         ###### travel time reward ######
+    #         travel_time_reward = 0.0
+    #         BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+    #         # find route from selected next edge to destination edge
+    #         route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+
+    #         if len(route.edges) != 0:  
+    #             travel_time = route.travelTime
+    #             travel_time_reward = -travel_time
+    #         else:
+    #             travel_time_reward = -BIG_PENALTY
+    #             logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+    #         # logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+
+    #         if not self.agents_manager.disaster_info:
+    #             logger.warning("No disaster information available, returning travel time reward only.")
+    #             return travel_time_reward
+
+    #         ###### distance to nearest disaster reward ######
+    #        # Get all disaster IDs and their distances from the next edge to the disasters
+    #         disaster_ids = list(self.agents_manager.disaster_info.keys())
+    #         distances = np.array([
+    #             self.agents_manager.edges_dist_disaster[next_edge][disaster_id] 
+    #             for disaster_id in disaster_ids
+    #         ])
+    #         # Find nearest disaster
+    #         min_idx = np.argmin(distances)
+    #         min_distance = distances[min_idx]
+    #         nearest_disaster_id = disaster_ids[min_idx]
+
+    #         # Get speed of edges in the NEAREST disaster zone
+    #         nearest_disaster_edges = self.agents_manager.disaster_zones[nearest_disaster_id]
+    #         speeds_nearest_disaster = [
+    #             self.agents_manager.edges[edge_id]['speed'] 
+    #             for edge_id in nearest_disaster_edges
+    #         ]
+    #         # Calculate reward: distance / speed = time to reach nearest disaster
+    #         # speed_nearest_disaster = np.median(speeds_nearest_disaster)  # or np.mean()
+    #         # reward_disaster = min_distance / speed_nearest_disaster
+    #         # logger.debug(f"Reward (time to nearest disaster): {reward_disaster}")
+            
+    #         ############ TODO:Normalized all rewards
+    #         r1_norm = 1- travel_time_reward / self.agents_manager.CONFIG['simulation_steps']
+    #         r2_norm = 1- np.exp(-min_distance/self.R)
+    #         final_r = self.agents_manager.w1*r1_norm + self.agents_manager.w2*r2_norm
+    #         logger.debug(f"R1 norm={r1_norm}, R2 norm={r2_norm}, final={final_r}")
+
+    #         return final_r
+    
+    def get_reward_7(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+            """
+            R= (R1^w1 * R2^w2)^1/(w1+w2)
+            R1 = 1-t/T_max where t<tmax
+            R2=d/dmax where d<=dmax
+            """
+            ###### travel time reward ######
+            travel_time_reward = 0.0
+            append_route = None
+            BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+            # find route from selected next edge to destination edge
+            route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            
+            # normalize r1 between [0, 1]
+            if len(route.edges) != 0:  
+                travel_time_reward = route.travelTime
+                append_route = list(route.edges)
+            else:
+                travel_time_reward = 0
+                logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+                return travel_time_reward
+            # logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+
+            norm_r1 = BIG_PENALTY-travel_time_reward
+            if not self.agents_manager.disaster_info:
+                logger.warning("No disaster information available, returning travel time reward only.")
+                return travel_time_reward
+
+            ###### distance to nearest disaster reward ######
+           # Get all disaster IDs and their distances from the next edge to the disasters
+            disaster_ids = list(self.agents_manager.disaster_info.keys())
+            distances = np.array([
+                self.agents_manager.edges_dist_disaster[next_edge][disaster_id] 
+                for disaster_id in disaster_ids
+            ])
+            # Find nearest disaster to the vehicle
+            nearest_idx = np.argmin(distances)
+            nearest_distance = distances[nearest_idx]
+            # find farthest disaster
+            # max_idx = np.argmax(distances)
+            # max_distance = distances[max_idx]
+            max_distance = self.R
+            # normalize r2 between [0,1]
+            norm_r2 = min(nearest_distance,max_distance) / max_distance * BIG_PENALTY
+    
+            final_r = (norm_r1**self.agents_manager.w1 * norm_r2**self.agents_manager.w2)**(1/(self.agents_manager.w1 + self.agents_manager.w2))
+            # final_r = np.log(final_r + 0.00001)
+            # logger.debug(f"R1 norm={travel_time_reward}, R2 norm={disaster_reward}, final={final_r}")
+            # final_r = -np.sqrt(self.agents_manager.w1*norm_r1**2 + self.agents_manager.w2*norm_r2**2)
+            return final_r, append_route
+
+    # def get_reward_7(self, curr_edge, next_edge, dest_edge, vehicle_id, feasible_actions):
+    #         """
+    #         R= w1R1 - P
+    #         """
+    #         ###### travel time reward ######
+    #         travel_time_reward = 0.0
+    #         BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+    #         # find route from selected next edge to destination edge
+    #         route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            
+    #         # normalize r1 between [0, 1]
+    #         if len(route.edges) != 0:  
+    #             travel_time_reward = -route.travelTime
+    #         else:
+    #             travel_time_reward = -BIG_PENALTY
+    #             logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+    #             return travel_time_reward
+    #         # logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+
+    #         if not self.agents_manager.disaster_info:
+    #             logger.warning("No disaster information available, returning travel time reward only.")
+    #             return travel_time_reward
+
+    #         ###### distance to nearest disaster reward ######
+    #        # Get all disaster IDs and their distances from the next edge to the disasters
+    #         disaster_edges = self.agents_manager.disaster_zones.values()
+    #         if next_edge in disaster_edges:
+    #             disaster_reward = -BIG_PENALTY
+    #         else:
+    #             disaster_reward = 0
+          
+    #         final_r = self.agents_manager.w1 * travel_time_reward + disaster_reward
+    #         return final_r
+
+    def save_not_survive_proba(self, disaster_radius, ds):
+        # Check and create folder if it doesn't exist
+        output_dir = os.path.join(os.path.dirname(__file__), '../..', 'result/disaster_metric') 
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if ds > disaster_radius:
+            not_survive_proba = 0    
+        else:
+            # Calculate not survival probability
+            not_survive_proba = 1 - (ds/disaster_radius)
+        
+        # Create new data row
+        new_data = {
+            'disaster_radius': disaster_radius,
+            'distance': ds,
+            'not_survive_probability': not_survive_proba
+        }
+        
+        # Define file path
+        filepath = os.path.join(output_dir, "not_survive_proba_R1R2.csv")
+        
+        # Append to existing CSV or create new one
+        if os.path.exists(filepath):
+            # Read existing data and append new row
+            df_existing = pd.read_csv(filepath)
+            df_new = pd.DataFrame([new_data])
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+            df_combined.to_csv(filepath, index=False)
+        else:
+            # Create new CSV file
+            df_new = pd.DataFrame([new_data])
+            df_new.to_csv(filepath, index=False)
+        
+        print(f"Result appended to: {filepath}")
+
+    def get_penalty_loop_R1(self, actual_travel_time):
+        # return -actual_travel_time
+        # return -650
+        max_simu_time = self.agents_manager.CONFIG['simulation_steps']
+        return -max_simu_time
+
+    def get_penalty_loop_R1R2(self, actual_travel_time, next_edge, dest_edge, vehicle_id):
+        
+        origin = self.agents_manager.trips[vehicle_id]['from']
+        dest = self.agents_manager.trips[vehicle_id]['to']
+        distance =  self.agents_manager.dist_OD[origin][dest]
+        t_min_od = distance / self.agents_manager.max_speed_vehs
+        # return 1 / (1+ (actual_travel_time/t_min_od))
+        # return -1.2
+
+        # TODO: BELOW IS WRONG FORMULA, NEED TO FIX
+        # distance =  self.agents_manager.edges_distance[next_edge][dest_edge]
+        # t_min_next_edge = distance / self.agents_manager.max_speed_vehs
+        # reward  = (0.00001 + t_min_next_edge) / (0.00001 + actual_travel_time)
+        # return -reward
+
+        return -1.2
+
+    def get_penalty_loop_R1_in_dead_edge(self, max_simu_steps):
+        return -2*max_simu_steps
+    
+    def get_penalty_loop_R1R2_in_dead_edge(self):
+        return -1.2
+
+    def get_reward_offline_training(self, curr_edge, next_edge, dest_edge, 
+                                     disaster_move):
+            """
+            Normalize distance to time unit
+            [m] -> [s]
+            This reward combine between travel time and distance to nearest disaster coordinate
+            final_reward
+            """
+            ###### travel time reward ######
+            travel_time_reward = 0.0
+            BIG_PENALTY = self.agents_manager.CONFIG['simulation_steps'] 
+
+            route = traci.simulation.findRoute(next_edge, dest_edge, routingMode=traci.constants.ROUTING_MODE_AGGREGATED)
+            
+            if len(route.edges) != 0:  
+                travel_time = route.travelTime
+                travel_time_reward = -travel_time
+            else:
+                travel_time_reward = -BIG_PENALTY
+                logger.debug(f"penalty for no route from {next_edge} to {dest_edge}: {travel_time_reward}")
+            logger.debug(f"travel time reward: {travel_time_reward} for the edge chosen {next_edge}, at current edge {curr_edge}")
+            
+
+            if not disaster_move:
+                logger.error("No disaster POI file provided, returning travel time reward only.")
+                return travel_time_reward
+
+            # otherwise, we calculate the risk reward
+            risk_reward = -disaster_move.get_risk_edge(next_edge)
+            if not risk_reward:
+                logger.error(f"Not found risk for this edge. Return only trave time")
+                return travel_time_reward
+
+            logger.debug(f"Travel time reward {travel_time_reward}, Risk reward {risk_reward}")
+            final_reward = self.agents_manager.w1*travel_time_reward + self.agents_manager.w2*risk_reward
+            logger.debug(f"Final reward of choosing next edge {next_edge}: {final_reward}")
+            return final_reward
+
+
+
+
+  

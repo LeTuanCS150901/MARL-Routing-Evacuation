@@ -1,0 +1,131 @@
+# manhattan_noenc.yaml - Manhattan: Coop-Eva without encoder (ablation).
+# 4 groups (one per shelter), 5 hazard zones. SUMO rules: lights off, no internal links, keep-clear on,
+# junction blocker -1, collision warn, teleport after 300 s. Speed updates S1-S5 on.
+# Default training demand: manhattan2train.rou.xml (80 cars).
+# Train:     python train.py --config manhattan_noenc --run-name <name>
+# Inference: python infer.py --config manhattan_noenc --model <name> --episode <N> --demand <file.rou.xml>
+
+# ---------- network and files ----------
+sumo_event_log: true                                         # sumo_events_*.txt in the run folder: collisions, teleports, running / halted cars every 500 s
+net_file: "../network/manhattan2/manhattan2.net.xml"         # road network (keep-clear on)
+route_file: "../network/manhattan2/manhattan2train.rou.xml"  # default demand file (training); --demand overrides it
+sumo_config: "../network/manhattan2/manhattan2.sumocfg"      # base SUMO config; each run writes its own copy (run.sumocfg) in its output folder
+saved_route: "../network/manhattan2/routes.xml"              # replaced by <run>/sumo/routes.xml
+routing_algorithm: "astar"
+saved_dir: 'manhattan2'                                      # training logs go to result/<saved_dir>/<run-name>/
+
+# ---------- groups (one agent per shelter) ----------
+destinations_edges: ['542258337#0', '68325062#0', '195745917#0', '1030123275#0'] # one shelter road per group (= one agent per group)
+origin_edges: ['384649121#0', '350726028#0', '464683329#0', '542096279#0'] # start roads of the groups
+
+# ---------- hazards ----------
+disaster:
+  fire:
+    disaster_zones:                                          # hazard zones (roads near a fire): agent input and reward penalty
+        1: ['1061622295#0']
+        2: ['384178813#0']
+        3: ['-945473887#2', '-438389785#2']
+        4: ['441405436#0']
+        5: ['350726031', '-458106348#2']
+    type: 'fire'
+    feature_dim: 5                                           # hazard input = distance to each zone
+  radius_safe: 25                                            # metres
+
+# ---------- training ----------
+num_episodes: 150                                            # training episodes
+simulation_steps: 1500                                       # seconds per training episode (also the late-arrival penalty P)
+batch_size: 32                                               # S5: 32 (one update every 2 s)
+update_every: 2                                              # S5: one network update every 2 simulated seconds with new decisions
+beta_soft: 0.01                                             # soft target update rate
+buffer_capacity: 1000000
+learning_rate: 0.000015
+gamma: 0.99                                                  # discount
+max_grad_norm: 10                                            # gradient clipping
+weight_decay: 1e-4
+
+# ---------- loss and optimisation ----------
+optimizer: adamw
+loss_reduction: mean
+reward_scale: 0.1                                           
+lr_schedule: none
+grad_log_every: 200                                          # S1: log gradient norms every N-th update
+batched_actions: true                                        # S4: one network call per group per second
+reward_function: get_reward_5                                # r = -w1 * time left to the shelter + w2 * time before a hazard reaches the car - P * (hazard entry or late)
+target_mask: feasible                                        # Double DQN target over feasible next roads only
+huber_delta: 10                                              # Huber loss threshold
+vdn_loss:
+  per_car_lambda: 0.0                                        # loss = group TD error + lambda * sum of per-car TD errors
+  priority: group                                            # replay priority: max = max of group and car TD errors; group = group only
+
+# ---------- resume a training run ----------
+resume:
+  from_episode: null                                         # continue training from this checkpoint episode
+  from_run: null                                             # load that checkpoint from another run folder
+  beta: hold
+  reseed: same
+save_state:
+  buffer: end                                                # save replay buffers: end / every / off
+  rng: true                                                  # save random states with each checkpoint
+
+# ---------- model ----------
+model:
+  encoder:
+    num_heads: 4                                             # attention heads
+    head_dim: 64
+    num_encoder_layers: 2
+    norm_first: false                                        # false = Post-LN
+    enabled: false
+  q_network:
+    hidden_sizes: [512, 512, 256]                            # Q-network layers
+softmax:
+  tau: 2.7                                                   # softmax temperature during training (exploration)
+inference_action: softmax                                    # softmax = sample from softmax(Q / inference_tau); greedy = best Q
+inference_tau: 1                                             # softmax temperature at inference (1 in the paper)
+inference_pool: ego                                          # ego = each car decides alone; oracle = same-second cars of a group encoded together (--pool group)
+hazard_close: false                                          # true = close the hazard roads to cars at the start (default: open)
+
+# ---------- reward ----------
+reward_mode: legacy_end
+no_arrival_penalty_s: null                                   # null = simulation_steps
+gamma_per_second: null
+team:
+  lambda: 0.0
+shelter_rule: true
+grouping: same_second                                        # cars of a group that decide in the same second form one training sample
+shaping:
+  enabled: false
+
+# ---------- prioritised replay ----------
+replay:
+  type: per
+  alpha: 0.6
+  beta_start: 0.4
+  beta_end: 1.0
+  eps: 1.0e-6
+  uniform_ratio: 0.2
+  done_ratio: 0.1
+  compact_obs: true                                          # S3: compact observations in the replay buffer
+  split_cars: true                                           # store each car's decision as its own sample (no-encoder ablation)
+
+# ---------- SUMO rules (lights off and no internal links are set by run.py) ----------
+sumo_rules:
+  ignore_junction_blocker: -1                                # -1 = off
+  collision_action: warn                                     # warn = count collisions only
+
+# ---------- normalisation and reward weights ----------
+max_vehicles_edge: 20                                        # normalisation of the density input
+max_speed: 39.44                                             # m/s, normalisation
+reward_type: "R1"
+reward:
+  MSE:
+    d_weight: 1
+    dead_edge: -10000000000000
+  R1R2:
+    w1: 0.8                                                  # weight of the travel-time term
+    w2: 0.2                                                  # weight of the hazard-distance term
+
+# ---------- legacy keys read by the code (unused) ----------
+offline_training: False
+epsilon_greedy: {initial: 1, final: 0.001, decay: 600}
+UCB: {c: 2}
+adaptive_layer_controller: {cooldown: 500, epsilon: 1e-6, threshold: 450, window_size: 100}

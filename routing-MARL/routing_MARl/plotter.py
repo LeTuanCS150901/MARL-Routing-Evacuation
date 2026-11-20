@@ -1,0 +1,375 @@
+import numpy as np  
+import matplotlib.pyplot as plt  
+import os
+from datetime import datetime  
+import xml.etree.ElementTree as ET
+
+from logs.logger import logger  # import our custom logger
+from read_config import get_config
+
+class MultiAgentPlotter:  
+    def __init__(self, agent_group_ids, max_episodes, resume_episode=None):    
+        """  
+        Initialize records for multiple agents.  
+        agent_ids: list of unique agent identifiers (could be strings or ints)  
+        """  
+        self.CONFIG = get_config()
+        self.loss_records = []  
+        self.reward_records = []
+        self.agent_group_ids = agent_group_ids  
+        self.max_episodes = max_episodes  
+        self.current_episode = 0
+        self.resume_episode = resume_episode
+
+        self.disaster_zones = self.CONFIG['disaster']['fire']['disaster_zones']
+
+        self.init_loss_records(agent_group_ids, max_episodes)  
+        self.init_reward_records(agent_group_ids, max_episodes)
+
+        self.loss_reward_path, self.arrival_path, self.survival_path, self.gradient_path = self.init_results_per_eps()
+        if resume_episode:
+            self.current_episode = int(resume_episode)
+
+    def init_loss_records(self, agent_group_ids, num_episodes):  
+        # Initialize loss records as a list of dictionaries  
+        self.loss_records = [{group_id: [] for group_id in agent_group_ids} for _ in range(num_episodes)]  
+
+    def init_reward_records(self, agent_group_ids, num_episodes):  
+        # Initialize loss records as a list of dictionaries  
+        self.reward_records = [{group_id: [] for group_id in agent_group_ids} for _ in range(num_episodes)]     
+
+    def init_results_per_eps(self):
+        """
+        Init file for saving loss and reward, and arrvied vehicles in each eps during training
+        """
+
+        result_folder = os.path.join(os.path.dirname(__file__), '..', 'result')  
+        if not os.path.exists(result_folder):  
+            os.makedirs(result_folder)  
+            logger.info(f"Created result folder: {result_folder}")  
+        
+        # Set up specific subfolder  
+        full_result_path = os.path.join(result_folder, self.CONFIG['saved_dir'])  
+        if not os.path.exists(full_result_path):  
+            os.makedirs(full_result_path)  
+            logger.info(f"Created subfolder: {full_result_path}")  
+        
+        # Create filename with timestamp  
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.resume_episode:
+            # resume: append to this run's training logs (the one set with an episode_reward file; inference runs into the
+            # same folder leave extra sets without it); none yet is allowed only for a new run folder (from_run)
+            old = sorted(f for f in os.listdir(full_result_path) if f.startswith('gradient_') and f.endswith('.txt')
+                         and os.path.exists(os.path.join(full_result_path, 'episode_reward_' + f[len('gradient_'):])))
+            if len(old) > 1:
+                raise RuntimeError(f"resume: {len(old)} log sets in {full_result_path}, expected 1")
+            if not old and not (self.CONFIG.get('resume') or {}).get('from_run'):
+                raise RuntimeError(f"resume: no logs in {full_result_path} to append to (set resume.from_run for a new run folder)")
+            if old:
+                stamp = old[0][len('gradient_'):-len('.txt')]
+                logger.success(f"resume: appending to the logs {stamp} in {full_result_path}")
+                return tuple(os.path.join(full_result_path, f'{n}_{stamp}.txt')
+                             for n in ('training_log', 'arrived_vehicles', 'survived_vehicles', 'gradient'))
+        loss_reward_path = os.path.join(full_result_path, f'training_log_{timestamp}.txt')
+        arrival_path = os.path.join(full_result_path, f'arrived_vehicles_{timestamp}.txt')
+        survival_path = os.path.join(full_result_path, f'survived_vehicles_{timestamp}.txt')
+        gradient_path = os.path.join(full_result_path, f'gradient_{timestamp}.txt')
+        
+        # Write the head for the file 
+        with open(loss_reward_path, 'w') as f:  
+            header = "Agent, Eps, Loss, Reward"
+            f.write(header)
+
+        with open(arrival_path, 'w') as f:  
+            header = "Eps, Arrived_Vehicles"
+            f.write(header)
+
+        with open(survival_path, 'w') as f:  
+            header = "Eps, Survived_Vehicles, Vehicles_Risk_IDs"
+            f.write(header)
+
+        with open(gradient_path, 'w') as f:
+            header = "step,group,layer,mean,std,norm"
+            f.write(header)
+            
+        logger.success(f"Created {loss_reward_path} for saving loss,reward at each eps")
+        return loss_reward_path, arrival_path, survival_path, gradient_path
+
+    def record_loss(self, group_id, loss):  
+        """  
+        Record loss value for the specific agent at specific episode.  
+        """  
+        # logger.debug(f"Recording loss for agent {group_id} at episode {self.current_episode}: {loss}")
+        try:  
+            # self.loss_records[self.current_episode][group_id].append(loss)  
+            self.write_each_loss(group_id, loss)
+        except Exception as e:  
+            logger.exception(f"Error recording loss for agent {group_id} at episode {self.current_episode}: {e}")  
+
+    def write_each_loss(self, group_id, loss):
+        """
+        Write each loss to file to track 
+        """
+        # Write the head for the file 
+        # No write reward, so we put it as -1
+        with open(self.loss_reward_path, 'a') as f:  
+            value= f"{group_id}, {self.current_episode}, {loss}, -1"
+            f.write("\n")
+            f.write(value)
+            
+    def write_each_gradient(self, step, group_id, layer, mean, std, norm):
+        """
+        Write each gradient to file to track 
+        """
+        # Write the head for the file 
+        with open(self.gradient_path, 'a') as f:  
+            value= f"{step}, {group_id}, {layer}, {mean}, {std}, {norm}"
+            f.write("\n")
+            f.write(value)
+
+    def write_each_reward(self, group_id, reward):
+        """
+        Write each loss to file to track 
+        """
+        # Write the head for the file 
+        # No write loss, so we put it as -1
+        with open(self.loss_reward_path, 'a') as f:  
+            value= f"{group_id}, {self.current_episode}, -1, {reward}"
+            f.write("\n")
+            f.write(value)
+
+    def record_reward(self, group_id, reward):
+        # logger.debug(f"Recording reward for agent {group_id} at episode {self.current_episode}: {reward}")
+        try:
+            # self.reward_records[self.current_episode][group_id].append(reward)
+            self.write_each_reward(group_id, reward)
+        except Exception as e:
+            logger.exception(f"Error recording reward for agent {group_id} at episode {self.current_episode}: {e}")
+
+    def write_weight_stat(self, group_id, layer, rms):
+        """episode, group, layer, weight RMS (written after each episode)"""
+        path = os.path.join(os.path.dirname(self.gradient_path), os.path.basename(self.gradient_path).replace('gradient_', 'weights_'))
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, {layer}, {rms}")
+
+    def write_episode_reward(self, group_id, arrived, wrong_shelter, failed, q1, q2, q3, team_reward,
+                             held_pushed, held_reward_sum, shelter_forced=0, hazard_vehicles=0, hazard_entries=0,
+                             clipped_steps=None, extra=None):
+        """evac_time mode, once per episode and group: outcomes, quartiles of the evacuation times T_i,
+        team reward, and the transitions held until the episode end."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'episode_reward_'))
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write("Eps, Group, Arrived, Wrong_Shelter, Failed, Q1_T, Q2_T, Q3_T, Team_Reward, "
+                        "Held_Pushed, Held_Reward_Sum, Shelter_Forced, Hazard_Vehicles, Hazard_Entries"
+                        + (", Clipped_Steps" if clipped_steps is not None else "")
+                        + "".join(f", {k}" for k in (extra or {})))
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, {arrived}, {wrong_shelter}, {failed}, "
+                              f"{q1:.1f}, {q2:.1f}, {q3:.1f}, {team_reward:.4f}, {held_pushed}, {held_reward_sum:.4f}, "
+                              f"{shelter_forced}, {hazard_vehicles}, {hazard_entries}"
+                              + (f", {clipped_steps}" if clipped_steps is not None else "")
+                              + "".join(f", {v}" for v in (extra or {}).values()))
+
+    def write_sumo_events(self, t_start, collisions, teleports, running, halting):
+        """sumo_event_log: one row per 500 s of the episode."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'sumo_events_'))
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write("Eps, T_start, Collisions, Teleports, Running, Halting")
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {t_start}, {collisions}, {teleports}, {running}, {halting}")
+
+    def write_train_stats(self, group_id, n_updates, loss_raw, weight_mean, done_share, done_size, buf_size, beta):
+        """Once per episode and group: updates, mean unweighted loss, mean importance weight, share of done items
+        in the batches, done-set size, buffer size, beta."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'train_stats_'))
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write("Eps, Group, Updates, Loss_Unweighted, Weight_Mean, Done_Share, Done_Size, Buffer_Size, Beta")
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, {n_updates}, {loss_raw:.5f}, {weight_mean:.5f}, "
+                              f"{done_share:.4f}, {done_size}, {buf_size}, {beta:.4f}")
+
+    def write_vdn_stats(self, group_id, loss_group, loss_car, gnorm, clipped_pct, hidden_pct, multi_cars):
+        """vdn_loss, once per episode and group: mean group loss and per-car loss per update (unweighted), mean gradient
+        norm before clipping, % updates clipped, % cars in groups of 2+ whose |delta_i| > |delta_sum| (hidden), their count."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'vdn_stats_'))
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write("Eps, Group, Loss_Group, Loss_PerCar, GradNorm_Mean, Clipped_pct, Hidden_pct, Multi_Cars")
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, {loss_group:.5f}, {loss_car:.5f}, {gnorm:.4f}, "
+                              f"{clipped_pct:.2f}, {hidden_pct:.2f}, {multi_cars}")
+
+    def write_td_stats(self, group_id, acc):
+        """td_debug, once per episode and group: TD error d = Q_group - target (network units) per transition type
+        (ordinary / arrival-or-done / fine): count, mean d, mean |d|, share d > 0."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'td_stats_'))
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write("Eps, Group" + "".join(f", N_{t}, Mean_{t}, MeanAbs_{t}, PosShare_{t}"
+                                               for t in ("ordinary", "arrival", "fine")))
+        cells = []
+        for n, s, sa, pos in acc:
+            cells += [f"{int(n)}", f"{s / n:.4f}" if n else "nan", f"{sa / n:.4f}" if n else "nan", f"{pos / n:.4f}" if n else "nan"]
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, " + ", ".join(cells))
+
+    def write_evac_debug(self, line):
+        """evac_debug: one line per closed decision / team share: episode, vid, t, dt, reward, done, outcome."""
+        path = os.path.join(os.path.dirname(self.gradient_path),
+                            os.path.basename(self.gradient_path).replace('gradient_', 'evac_debug_'))
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {line}")
+
+    def write_decision_counts(self, group_id, counts):
+        """episode, group, number of stored transitions with N = 1, 2, 3, 4+ deciding vehicles"""
+        path = os.path.join(os.path.dirname(self.gradient_path), os.path.basename(self.gradient_path).replace('gradient_', 'decisions_'))
+        with open(path, 'a') as f:
+            f.write(chr(10) + f"{self.current_episode}, {group_id}, {counts[0]}, {counts[1]}, {counts[2]}, {counts[3]}")
+
+    def increase_episode(self):  
+        """  
+        Increase the current episode count.  
+        """  
+        if self.current_episode < self.max_episodes - 1:  # Allow an episode count to reach max_episodes  
+            self.current_episode += 1  
+
+    def plot_loss_and_reward_after_episode(self):  
+        episode_to_plot = self.current_episode  
+        if episode_to_plot >= self.max_episodes:  
+            episode_to_plot = self.max_episodes - 1  
+        # Actually, in usage, you want to plot the most recently finished episode:  
+        # if you call increase_episode() at end of iteration:  
+        episode_to_plot = max(0, self.current_episode - 1)  
+
+        fig, axs = plt.subplots(2, 1, figsize=(10, 12))   
+
+        for group_id in self.agent_group_ids:  
+            loss = self.loss_records[episode_to_plot][group_id]  
+            reward = self.reward_records[episode_to_plot][group_id]  
+
+            if len(loss) > 0:  
+                axs[0].plot(loss, label=f"Agent {group_id}")  
+            if len(reward) > 0:  
+                axs[1].plot(reward, label=f"Agent {group_id}")  
+
+        axs[0].set_xlabel("Training Steps")  
+        axs[0].set_ylabel("Loss")  
+        axs[0].set_title(f"Loss for Each Agent at Episode {episode_to_plot + 1}")  
+        axs[0].grid()  
+        axs[0].legend()  
+
+        axs[1].set_xlabel("Simulation Steps")  
+        axs[1].set_ylabel("Reward")  
+        axs[1].set_title(f"Reward for Each Agent at Episode {episode_to_plot + 1}")  
+        axs[1].grid()  
+        axs[1].legend()  
+
+        plt.tight_layout(pad=3.0)  
+        plt.show()  
+
+    def write_to_file(self):  
+        """  
+        At the final epoch
+        Write the loss and reward records to a file in the 'result' folder.  
+        """  
+        # Set up base result folder  
+        result_folder = os.path.join(os.path.dirname(__file__), '..', 'result')  
+        if not os.path.exists(result_folder):  
+            os.makedirs(result_folder)  
+            logger.info(f"Created result folder: {result_folder}")  
+        
+        # Set up specific subfolder  
+        full_result_path = os.path.join(result_folder, self.CONFIG['saved_dir'])  
+        if not os.path.exists(full_result_path):  
+            os.makedirs(full_result_path)  
+            logger.info(f"Created subfolder: {full_result_path}")  
+        
+        # Create filename with timestamp  
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  
+        file_path = os.path.join(full_result_path, f'training_log_{timestamp}.txt')  
+        
+        # Write data to file  
+        with open(file_path, 'w') as f:  
+            for episode in range(self.max_episodes):  
+                f.write(f"Episode {episode + 1}:\n")  
+                for group_id in self.agent_group_ids:  
+                    f.write(f"  Agent {group_id}:\n")  
+                    f.write(f"    Loss: {self.loss_records[episode][group_id]}\n")  
+                    f.write(f"    Reward: {self.reward_records[episode][group_id]}\n")  
+
+        logger.info(f"Loss and reward records written to {file_path}")
+
+    def write_arrived_vehicles(self, arrived_vehicles):
+        """
+        Write each loss to file to track 
+        """
+        # Write the head for the file 
+        # No write reward, so we put it as -1
+        with open(self.arrival_path, 'a') as f:  
+            value= f"{self.current_episode}, {arrived_vehicles}"
+            f.write("\n")
+            f.write(value)
+
+    def write_survived_vehicles(self):
+        """
+        Write survival vehs 
+        """
+
+        if not self.disaster_zones:
+            return 
+        
+        XML_FILE_PATH = self.CONFIG['saved_route']
+        # The list of edges considered as disruption points
+        disruption_edges = [edge for edge_list in self.disaster_zones.values() for edge in edge_list]
+
+        # Initialize a set to store the IDs of vehicles using a disrupted edge
+        disrupted_vehicle_ids = set()
+        num_vehicles = 0
+
+        # --- XML Parsing and Processing ---
+        try:
+            if not os.path.exists(XML_FILE_PATH):
+                raise FileNotFoundError(f"The file was not found at: {XML_FILE_PATH}")
+
+            # Use ET.parse() directly on the file path
+            tree = ET.parse(XML_FILE_PATH)
+            root = tree.getroot()
+
+            # Iterate over every 'vehicle' element
+            for vehicle in root.findall('vehicle'):
+                vehicle_id = vehicle.get('id')
+                num_vehicles +=1 
+ 
+                # Find the nested 'route' element
+                route = vehicle.find('route')
+                
+                if route is not None:
+                    # Get the edges string and split it into a list
+                    edges_string = route.get('edges', "")
+                    vehicle_edges = edges_string.split()
+                    
+                    # Check if any vehicle edge is in the disruption list
+                    if any(edge in disruption_edges for edge in vehicle_edges):
+                        disrupted_vehicle_ids.add(vehicle_id)
+        except Exception as e:
+            logger.error(f"Error occurred when outputing survival vehicles: {e}")
+
+        # --- Output Results ---
+        num_disrupted_vehicles = len(disrupted_vehicle_ids)
+        survived_vehicles = num_vehicles - num_disrupted_vehicles
+        # Write the head for the file 
+        # No write reward, so we put it as -1
+        
+        with open(self.survival_path, 'a') as f:  
+            value= f"{self.current_episode}, {survived_vehicles}, {disrupted_vehicle_ids}"
+            f.write("\n")
+            f.write(value)
+            logger.success(f"Successfully wrote survived vehicles for episode {self.current_episode}")
